@@ -17,11 +17,6 @@ type Offset = {
 	end: number;
 };
 
-type OffsetDiff = {
-	len: number;
-	diff: number;
-};
-
 const encoder = new TextEncoder();
 
 export function validateSecret(env: Env, secret: string): boolean {
@@ -66,206 +61,65 @@ export async function modifyComments(env: Env, path: string, diff: ModifiedComme
 	}
 
 	const replacement: Replacement[] = [];
+	const offsets: Offset[] = []; // get offsets in some way
+	const offsetsDelta: Offset[] = []; // 长度和offsets一样，但是里面的值是diff的delta，初始值是0
+	// 理论上这玩意的类型最好改改，但是我为了demo就不改了
 
-	// Sort diff by i1
-	diff = diff.sort((a, b) => a.i1 - b.i1);
-
-	function _calcDiff(
-		offsets: Offset[],
-		pseudoOffsetsDiffArr: {
-			beforeEverything: OffsetDiff;
-		},
-		offsetsDiffArr: OffsetDiff[],
-	) {
-		for (const { tag, i1, i2, j1, j2 } of diff) {
-			// console.log('In diff:', tag, i1, i2, j1, j2);
-			switch (tag) {
-				case 'insert': {
-					const offsetIdx = offsets.findIndex((offset: { start: number; end: number }) => offset.start <= i1 && offset.end >= i1);
-					// 插入点在某个区间内
-					if (offsetIdx >= 0) {
-						// 更改区间长度
-						const diff = offsetsDiffArr[offsetIdx];
-						// console.log('  插入点在某个区间内：', diff.len, j2 - j1); // checked
-						diff.len += j2 - j1;
-					}
-					// 插入点在任意区间外
-					else {
-						// 更改距离插入位置最近的前一个区间的差分
-						const diff = offsets.findIndex((offset: { start: number }) => offset.start > i1) - 1;
-						// console.log('  插入点在任意区间外：', diff, j2 - j1); // checked
-						// 如果插入位置在所有 offset 区间前
-						if (diff == -1) {
-							pseudoOffsetsDiffArr.beforeEverything.diff += j2 - j1;
-						} else if (diff >= 0) {
-							offsetsDiffArr[diff].diff += j2 - j1;
-						}
-					}
-
-					break;
+	// 时间复杂度：O(n * m)，n 是 offsets 的个数，m 是 diff 的个数
+	// 这里如果用差分优化的话，可以优化到 O(n + m)。大概是用一个哈希表来维护，原文中的第i个位置，在经过一系列ops操作后的位置移动情况。将这个哈希表的值累加起来，可以得到每个位置最终的总偏移量。
+	// 在我们有完整的测试用例的情况下，可以考虑这个优化。
+	for (const { tag, i1, i2, j1, j2 } of diff) {
+		for (let i = 0; i < offsets.length; i++) {
+			const { start, end } = offsets[i];
+			// 对于 insert，讨论 i1 和 [start, end] 的三种情况
+			if (tag === 'insert') {
+				const insertedLength = j2 - j1;
+				if (i1 < start) {
+					offsetsDelta[i].start += insertedLength;
+				} else if (start <= i1 && i1 <= end) {
+					offsetsDelta[i].end += insertedLength;
+				} else {
+					// i1 > end, 不受影响
 				}
-
-				case 'replace':
-				case 'delete': {
-					// 如果该 diff 在所有 offset 区间前
-					if (i2 <= pseudoOffsetsDiffArr.beforeEverything.len + pseudoOffsetsDiffArr.beforeEverything.diff) {
-						// console.log('  该 diff 在所有 offset 区间前', i2 - i1 - (j2 - j1)); // checked
-						pseudoOffsetsDiffArr.beforeEverything.diff -= i2 - i1 - (j2 - j1);
-						break;
+			} else {
+				// 对于 replace 和 delete
+				// 讨论 [i1, i2] 和 [start, end] 的六种情况
+				// 边界点我没有仔细想就先不写了
+				if (i2 < start) {
+					const lengthDelta = j2 - j1 - (i2 - i1);
+					offsetsDelta[i].start += lengthDelta;
+					offsetsDelta[i].end += lengthDelta;
+				} else if (start <= i2 && i2 <= end) {
+					if (i1 < start) {
+						// 这类有点复杂的例子我没有仔细想，是copilot给的
+						offsetsDelta[i].end += j2 - j1 - (end - i2);
+						offsetsDelta[i].start += j1 - i1;
+					} else {
+						offsetsDelta[i].end += j2 - j1 - (i2 - i1);
 					}
-
-					const offsetIdxs = offsets.map((_: any, idx: number) => idx);
-					offsetIdxs.unshift(-1);
-
-					for (const offsetIdx of offsetIdxs) {
-						const { start, end } = offsetIdx === -1 ? { start: 0, end: pseudoOffsetsDiffArr.beforeEverything.len } : offsets[offsetIdx];
-						const diff = offsetIdx === -1 ? pseudoOffsetsDiffArr.beforeEverything : offsetsDiffArr[offsetIdx];
-						// console.log('  offsetIdx:', offsetIdx, start, end, diff);
-
-						// 如果 diff 完全包含 offset
-						if (i1 <= start && i2 >= end) {
-							// console.log('  diff 完全包含 offset', diff); // checked
-							diff.len = 0;
-						}
-						// 如果 offset 完全包含 diff
-						else if (start <= i1 && end >= i2) {
-							// console.log('  offset 完全包含 diff', diff, diff.len - (i2 - i1 - (j2 - j1))); // checked
-							diff.len -= i2 - i1 - (j2 - j1);
-						}
-						// 如果 diff 左半边在 offset 内，右半边在 offset 外
-						else if (i1 >= start && i1 <= end) {
-							if (tag === 'delete') {
-								// console.log('  diff 左半边在 offset 内，右半边在 offset 外', diff, end - i1); // checked
-								diff.len -= end - i1;
-							}
-						}
-						// 如果 diff 右半边在 offset 内，左半边在 offset 外
-						else if (i2 >= start && i2 <= end) {
-							if (tag === 'delete') {
-								// console.log('  diff 右半边在 offset 内，左半边在 offset 外', diff, i2 - start); // checked
-								diff.len -= i2 - start;
-							}
-						}
+				} else {
+					// i2 > end
+					if (i1 < start) {
+						// 整个被替换/删除，应该移除掉。我这里没写！
+					} else if (start <= i1 && i1 <= end) {
+						offsetsDelta[i].end += j2 - j1 - (end - i1);
+					} else {
+					// i1 > end, 不受影响
 					}
-
-					// 如果有 diff 跨多段 offset，那么直接删除多段 offset 的 diff
-					if (tag === 'replace') {
-						const cross = offsetIdxs
-							.map((offsetIdx) => ({
-								offset: offsetIdx === -1 ? { start: 0, end: pseudoOffsetsDiffArr.beforeEverything.len } : offsets[offsetIdx],
-								diff: offsetIdx === -1 ? pseudoOffsetsDiffArr.beforeEverything : offsetsDiffArr[offsetIdx],
-							}))
-							.filter((d) => (i1 >= d.offset.start && i1 <= d.offset.end) || (i2 >= d.offset.start && i2 <= d.offset.end));
-						if (cross.length > 1) {
-							let len = cross.reduce((acc, d) => acc + d.diff.len, 0);
-							// 跨段 diff 转 len 补偿
-							len += cross.slice(-1).reduce((acc, d) => acc + d.diff.diff, 0);
-							for (const d of cross) {
-								// console.log('  跨段 replace', d, diff);
-								d.diff.len = 0;
-							}
-							cross[0].diff.diff += len - (i2 - i1 - (j2 - j1));
-						}
-					}
-
-					break;
 				}
 			}
 		}
 	}
-
-	// Distinct offsets
-	const offsets = [
-		...new Map((await getComment(env, { path })).map((comment) => comment.offset).map((offset) => [offset.start, offset.end])).entries(),
-	]
-		.map(([start, end]) => ({ start, end }))
-		.sort((a, b) => a.start - b.start);
-
-	if (offsets.length === 0) {
-		return;
+	// apply delta to offsets
+	for (let i = 0; i < offsets.length; i++) {
+		const { start, end } = offsets[i];
+		const { start: startDelta, end: endDelta } = offsetsDelta[i];
+		replacement.push({
+			from: {
+				start: start + startDelta,
+				end: end + endDelta,
+			},
+		});
 	}
-
-	const pseudoOffsetsDiffArr = {
-		beforeEverything: {
-			len: 0,
-			diff: offsets[0].start,
-		},
-	};
-
-	// offsets diff array
-	const offsetsDiffArr = offsets.map((offset, idx, that) => ({
-		len: offset.end - offset.start,
-		diff: idx === that.length - 1 ? 0 : that[idx + 1].start - offset.end,
-	}));
-
-	const diffPseudoOffsetsDiffArr = {
-		beforeEverything: {
-			len: pseudoOffsetsDiffArr.beforeEverything.diff,
-			diff: 0,
-		},
-	};
-
-	let lastDiffOffsetEnd = diffPseudoOffsetsDiffArr.beforeEverything.len;
-	const diffOffsets = offsetsDiffArr.map((diff) => {
-		const offset = {
-			start: lastDiffOffsetEnd + diff.len,
-			end: lastDiffOffsetEnd + diff.len + diff.diff,
-		};
-		lastDiffOffsetEnd = offset.end;
-		return offset;
-	});
-
-	const diffOffsetsDiffArr = diffOffsets.map((offset, idx, that) => ({
-		len: offset.end - offset.start,
-		diff: idx === that.length - 1 ? 0 : that[idx + 1].start - offset.end,
-	}));
-
-	// console.log('Initialalize:', offsets, pseudoOffsetsDiffArr, offsetsDiffArr);
-	// 计算 offset 更改
-	_calcDiff(offsets, pseudoOffsetsDiffArr, offsetsDiffArr);
-	// console.log('Finalalize:', offsets, pseudoOffsetsDiffArr, offsetsDiffArr);
-
-	// console.log('Diff Initialalize:', diffOffsets, diffPseudoOffsetsDiffArr, diffOffsetsDiffArr);
-	// 计算 diff.diff 更改
-	_calcDiff(diffOffsets, diffPseudoOffsetsDiffArr, diffOffsetsDiffArr);
-	// 应用 diff.diff 更改到 offset
-	for (const [idx, diff] of diffOffsetsDiffArr.entries()) {
-		offsetsDiffArr[idx].diff += diff.len - (diffOffsets[idx].end - diffOffsets[idx].start);
-	}
-	pseudoOffsetsDiffArr.beforeEverything.diff += diffPseudoOffsetsDiffArr.beforeEverything.len - offsets[0].start;
-	// console.log('Diff Finalalize:', diffOffsets, diffPseudoOffsetsDiffArr, diffOffsetsDiffArr);
-
-	let lastOffset = {
-		start: 0,
-		end: pseudoOffsetsDiffArr.beforeEverything.len,
-	};
-	let lastDiff = {
-		len: 0,
-		diff: pseudoOffsetsDiffArr.beforeEverything.diff,
-	};
-	// console.log('Check (pseudo):', lastOffset, lastDiff);
-	for (const [idx, diff] of offsetsDiffArr.entries()) {
-		const offset = offsets[idx];
-		// console.log('Check:', offset, diff);
-
-		const from = {
-			start: offset.start,
-			end: offset.end,
-		};
-		const to = {
-			start: lastOffset.end + lastDiff.diff,
-			end: lastOffset.end + lastDiff.diff + diff.len,
-		};
-
-		if (diff.len === 0) {
-			replacement.push({ from });
-		} else {
-			replacement.push({ from, to });
-		}
-
-		lastOffset = to;
-		lastDiff = diff;
-	}
-
 	await updateCommentOffsets(env, path, replacement);
 }
